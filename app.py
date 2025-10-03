@@ -1,34 +1,41 @@
-from flask import Flask, request, jsonify
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 import numpy as np
+import json
 
-app = Flask(__name__)
+# Initialize the FastAPI application
+app = FastAPI(title="FlipFlop Adaptive Agent")
+
+# --- INPUT/OUTPUT MODELS ---
+class ScoreInput(BaseModel):
+    """Defines the expected input payload from the ESP32: {"score": 10}"""
+    score: int = 0
+
+class DifficultyOutput(BaseModel):
+    """Defines the structure of the JSON response sent back to the ESP32: {"difficulty_index": 1}"""
+    difficulty_index: int
 
 # --- NEURAL NETWORK MODEL DEFINITION ---
 
-# Mock Weights & Biases (Trained on simplified data: input=score)
-# Weights and biases are pre-set, simulating a trained model.
-# W: (1 input feature: score) x (3 output classes: 0, 1, 2)
+# Mock Weights & Biases (Simulates a trained single-layer network)
+# W: (1 input feature: score) x (3 output classes)
 # B: (3 output classes)
 W = np.array([[0.05], [0.15], [0.25]])
-B = np.array([-1.0, -4.0, -8.0])
+B = np.array([-1.0, -4.0, -8.0]) 
 
-def softmax(z):
-    """Softmax activation function for classification output."""
-    e_z = np.exp(z - np.max(z)) # Subtract max for numerical stability
+def softmax(z: np.ndarray) -> np.ndarray:
+    """Softmax activation function."""
+    e_z = np.exp(z - np.max(z)) 
     return e_z / e_z.sum(axis=0)
 
-def predict_category(score):
+def predict_category(score: int) -> tuple[int, np.ndarray]:
     """
-    Runs the lightweight neural network to classify player skill.
-    Input: Score (1 feature). Output: Probability for 3 categories.
+    Runs the lightweight neural network to classify player skill based on score.
     """
-    # 1. Input Processing (Input must be 1x1 array)
+    # 1. Input Processing
     X = np.array([score])
     
     # 2. Linear Layer: Z = W * X + B
-    # W is (1x3), X is (1x1). We must transpose/reshape for matrix multiplication.
-    # W.T is (3x1). X is (1x1). Result is (3x1).
-    # We use element-wise multiplication here for simplicity, treating score as a scalar.
     Z = (W * X).flatten() + B 
     
     # 3. Activation Layer (Softmax)
@@ -39,35 +46,42 @@ def predict_category(score):
     
     return category_index, probabilities
 
-# --- MAPPING: CATEGORY INDEX to DIFFICULTY INDEX ---
-# The NN output category (0, 1, 2) directly maps to the game difficulty index (0, 1, 2)
-# 0 (Struggling) -> 0 (EASY)
-# 1 (Steady)     -> 1 (MEDIUM)
-# 2 (Master)     -> 2 (HARD)
+# --- FASTAPI ENDPOINT ---
 
-@app.route('/adaptive_logic', methods=['POST'])
-def adaptive_logic():
-    """Endpoint that receives the current score and returns the appropriate difficulty index."""
+@app.post("/adaptive_logic", response_model=DifficultyOutput)
+async def adaptive_logic(data: ScoreInput):
+    """Receives score, predicts player category using NN, and returns difficulty index."""
     try:
-        data = request.get_json()
-        score = data.get('score', 0)
+        score = data.score
         
         # 1. Predict Player Category (0, 1, or 2)
         category_index, probabilities = predict_category(score)
         
-        # 2. Map Category to Difficulty Index
-        new_difficulty_index = category_index 
+        # 2. Map Category to Difficulty Index (Fixing NumPy type)
+        # CRITICAL FIX: Convert NumPy integer type to standard Python integer (int()) 
+        # to prevent the "int64 is not JSON serializable" error.
+        new_difficulty_index = int(category_index) 
         
-        print(f"Score: {score} | NN Output: {probabilities} | Predicted Category Index: {category_index}")
+        # Log the decision
+        log_data = {
+            "score": score,
+            "difficulty_index": new_difficulty_index,
+            "probabilities": probabilities.tolist() # Convert NumPy array to list for logging
+        }
+        print(f"Decision Log: {json.dumps(log_data)}")
         
-        # 3. Return the index in a simple JSON format
-        return jsonify({"difficulty_index": new_difficulty_index}), 200
+        # 3. Return the index
+        return DifficultyOutput(difficulty_index=new_difficulty_index)
 
     except Exception as e:
+        # Raise HTTP exception for error handling on client side
         print(f"Error processing request: {e}")
-        # Return default Medium difficulty (index 1) on error
-        return jsonify({"difficulty_index": 1, "error": str(e)}), 500
+        raise HTTPException(
+            status_code=500, 
+            detail={"difficulty_index": 1, "error": "Internal AI server error"}
+        )
 
-if __name__ == '__main__':
-    # Use gunicorn on Render, but Flask for local testing
-    app.run(host='0.0.0.0', port=5000)
+# --- ROOT (Health Check) ---
+@app.get("/")
+def read_root():
+    return {"status": "FlipFlop Adaptive Agent is Online"}
